@@ -1,0 +1,207 @@
+#!/bin/bash
+
+### BLOCK 1 ####
+SCRIPT_LOG_PATH="/tmp/$(date +'%Y-%m-%d')-$(basename "$0" .sh).log"
+
+log_message() {
+  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  local message="$1"
+  local formatted_message="[$timestamp] $message"
+  echo "$formatted_message"
+  echo "$formatted_message" >> "$SCRIPT_LOG_PATH" 2>&1
+}
+
+run_command() {
+    local cmd="$1"
+    log_message "Running command: $cmd"
+    eval "$cmd"
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        log_message "Command failed with exit code: $exit_code"
+    fi
+    return $exit_code
+}
+
+is_valid_app_bundle() {
+  local app_path="$1"
+  if [ ! -d "$app_path" ]; then
+    return 1
+  fi
+  if [[ ! "$app_path" =~ \.app$ ]]; then
+    return 1
+  fi
+  if [ ! -d "$app_path/Contents" ]; then
+    return 1
+  fi
+  if [ ! -f "$app_path/Contents/Info.plist" ]; then
+    return 1
+  fi
+  return 0
+}
+
+find_app_path() {
+    local input="$1"
+    local app_path=""
+    local bundle_id=""
+    local app_name=""
+
+    if [ -d "$input" ] && [ -x "$input" ]; then
+        app_path="$input"
+    elif [ -f "$input" ] && [ -x "$input" ]; then
+        app_path="$input"
+    else
+        app_path=$(mdfind "kMDItemKind == 'Application' && kMDItemFSName == '$input.app'" | head -n 1)
+        if [ -z "$app_path" ]; then
+            app_path=$(mdfind "kMDItemKind == 'Application' && kMDItemDisplayName == '$input'" | head -n 1)
+            if [ -z "$app_path" ]; then
+                log_message "mdfind did not return a path for: '$input'"
+            else
+                log_message "Found app via mdfind using display name: $app_path"
+            fi
+        else
+            log_message "Found app via mdfind: $app_path"
+        fi
+    fi
+
+    if [ -n "$app_path" ]; then
+      if is_valid_app_bundle "$app_path"; then
+        bundle_id=$(osascript -e "id of app \"$app_path\"" 2>/dev/null)
+        app_name=$(basename "$app_path" .app)
+        if [ $? -ne 0 ]; then
+            log_message "Could not get bundle identifier for '$app_path'."
+            echo ""
+            return 1
+        fi
+        echo "$app_path;$bundle_id;$app_name"
+        return 0
+      else
+        log_message "Invalid application bundle path: '$app_path'"
+        echo ""
+        return 1
+      fi
+    else
+        log_message "Could not find application path for: '$input'"
+        echo ""
+        return 1
+    fi
+}
+
+set -e
+
+if [ $# -eq 1 ]; then
+  app_input="$1"
+  log_message "Using application path from command-line argument: $app_input"
+elif [ $# -gt 1 ]; then
+  echo "Usage: $0 [application_name_or_path]" >&2
+  exit 1
+else
+  read -r -p "Enter the name or path of the RMM application: " app_input
+fi
+
+IFS=';' read -r app_path bundle_id app_name <<< "$(find_app_path "$app_input")"
+
+if [ -z "$app_path" ]; then
+  exit 1
+fi
+
+echo "Found application path: $app_path"
+echo "Bundle ID: $bundle_id"
+echo "App Name: $app_name"
+
+### BLOCK 1 END ###
+while true; do
+  echo "RMM Uninstall Tool (macOS) - Main Menu"
+  echo "--------------------------"
+  echo "Application: $app_name ($app_path)"
+  echo "Bundle ID: $bundle_id"
+  echo "--------------------------"
+  echo "1. Proceed with Uninstallation"
+  echo "2. Identify RMM Supporting Files (Dry Run)"
+  echo "3. Unload Launch Agents/Daemons (Forceful)"
+  echo "4. Get RMM info (If installed via Package)"
+  echo "5. Retrieve Connection Logs (if available)"
+  echo "6. Exit"
+  echo "--------------------------"
+
+  read -r -p "Choose an option (1-6): " choice
+
+  case "$choice" in
+    1)
+      log_message "User chose option 1: Proceed with Uninstallation"
+      quit_app "$app_path"
+      remove_app_bundle "$app_path"
+      find_and_remove_supporting_files "$app_name" "$bundle_id"
+      unload_launch_agents "$app_name" "$bundle_id"
+      break
+      ;;
+    2)
+      log_message "User chose option 2: Identify Supporting Files (Dry Run)"
+      find_and_remove_supporting_files "$app_name" "$bundle_id"
+      ;;
+    3)
+      log_message "User chose option 3: Unload Launch Agents/Daemons"
+      unload_launch_agents "$app_name" "$bundle_id"
+      ;;
+    4)
+      log_message "User chose option 4: Get RMM Info"
+      get_package_info "$app_path"
+      ;;
+    5)
+      log_message "User chose option 5: Retrieve Connection Logs"
+      retrieve_connection_logs "$app_name"
+      ;;
+    6)
+      log_message "User chose to exit."
+      exit 0
+      ;;
+    *)
+      echo "Invalid option. Please choose a number between 1 and 6."
+      ;;
+  esac
+done
+
+uninstall_with_pkgutil() {
+  local bundle_id="$1"
+  log_message "Attempting to uninstall using pkgutil for bundle ID: $bundle_id"
+
+  local package_ids=$(pkgutil --pkgs-for-bundle "$bundle_id" 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$package_ids" ]; then
+    log_message "No packages found for bundle ID: $bundle_id"
+    return 0
+  fi
+
+  for package_id in $package_ids; do
+    if confirm_action "Uninstall package '$package_id' (belonging to '$bundle_id')?"; then
+      log_message "Uninstalling package: $package_id"
+      run_command "pkgutil --forget '$package_id'"
+      if [ $? -eq 0 ]; then
+        log_message "Package '$package_id' unregistered successfully."
+      else:
+        log_message "Error unregistering package '$package_id'."
+      fi
+
+      log_message "Locating and removing files installed by package: $package_id"
+      local install_location=$(pkgutil --volume "$package_id" 2>/dev/null)
+      if [ -n "$install_location" ]; then
+        while IFS= read -r -d $'\0' file; do
+          if [ -e "$install_location$file" ]; then
+            log_message "Removing: $install_location$file"
+            run_command "rm -rf \"$install_location$file\""
+            if [ $? -ne 0 ]; then
+              log_message "Error removing: $install_location$file"
+            fi
+          fi
+        done < <(pkgutil --only-files --files "$package_id" -print0)
+
+        log_message "Files for package '$package_id' removed (if they existed)."
+      else:
+        log_message "Could not determine install location for package: $package_id"
+      fi
+
+    else:
+      log_message "Skipping uninstallation of package: $package_id"
+    fi
+  done
+}
+
+exit 0
